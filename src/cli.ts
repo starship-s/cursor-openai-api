@@ -4,7 +4,14 @@
  * Serves Cursor API as OpenAI-compatible endpoint with OAuth authentication.
  */
 import { login, logout, getStoredCredentials, isAuthenticated } from "./cli-auth";
-import { startProxy, stopProxy, getProxyPort } from "./proxy";
+import {
+  DEFAULT_PROXY_HOST,
+  INBOUND_API_KEY_ENV,
+  getProxyHost,
+  getProxyPort,
+  startProxy,
+  stopProxy,
+} from "./proxy";
 import { getCursorModels } from "./models";
 import { getTokenExpiry } from "./auth";
 
@@ -66,7 +73,7 @@ async function cmdModels() {
   }
 }
 
-async function cmdServe(port: number) {
+async function cmdServe(port: number, host: string) {
   const creds = getStoredCredentials();
   if (!creds) {
     console.log("❌ Not logged in. Run `cursor-api login` first.");
@@ -78,14 +85,16 @@ async function cmdServe(port: number) {
     process.exit(1);
   }
 
-  console.log(`🚀 Starting Cursor OpenAI API proxy on port ${port}...`);
-  console.log(`   Endpoint: http://localhost:${port}/v1`);
-  console.log(`   Models: http://localhost:${port}/v1/models`);
+  console.log(`🚀 Starting Cursor OpenAI API proxy on ${host}:${port}...`);
+  console.log(`   Endpoint: http://${host}:${port}/v1`);
+  console.log(`   Models: http://${host}:${port}/v1/models`);
+  console.log(`   Health: http://${host}:${port}/health`);
+  console.log(`   Inbound auth: ${process.env[INBOUND_API_KEY_ENV] ? "required" : "disabled"}`);
   console.log(`   Press Ctrl+C to stop.\n`);
 
-  const proxyPort = await startProxy(async () => creds.access, port);
+  const proxyPort = await startProxy(async () => creds.access, port, host);
 
-  console.log(`✅ Server running at http://localhost:${proxyPort}\n`);
+  console.log(`✅ Server running at http://${host}:${proxyPort}\n`);
 
   process.on("SIGINT", () => {
     console.log("\n\n👋 Shutting down...");
@@ -97,10 +106,28 @@ async function cmdServe(port: number) {
 function cmdStatus() {
   const port = getProxyPort();
   if (port) {
-    console.log(`🟢 Proxy running on port ${port}`);
+    const host = getProxyHost() ?? DEFAULT_PROXY_HOST;
+    console.log(`🟢 Proxy running on ${host}:${port}`);
   } else {
     console.log("🔴 Proxy not running");
   }
+}
+
+function getServeHost(): string {
+  return process.env.HOST?.trim() || DEFAULT_PROXY_HOST;
+}
+
+function getServePort(): number {
+  const rawPort = process.env.PORT;
+  if (!rawPort) return PROXY_PORT;
+
+  const port = Number.parseInt(rawPort, 10);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.error(`Invalid PORT: ${rawPort}. Using default ${PROXY_PORT}.`);
+    return PROXY_PORT;
+  }
+
+  return port;
 }
 
 function showHelp() {
@@ -114,14 +141,14 @@ Commands:
   logout                Clear stored credentials
   whoami                Show current authentication status
   models                List available Cursor models
-  serve [port]          Start the OpenAI-compatible proxy server (default port: ${PROXY_PORT})
+  serve                 Start the OpenAI-compatible proxy server (default: ${DEFAULT_PROXY_HOST}:${PROXY_PORT})
   status                Show proxy server status
   help                  Show this help message
 
 Examples:
   cursor-api login
   cursor-api models
-  cursor-api serve 8080
+  HOST=127.0.0.1 PORT=3000 cursor-api serve
 `);
 }
 
@@ -143,12 +170,7 @@ async function main() {
       await cmdModels();
       break;
     case "serve": {
-      const envPort = parseInt(process.env.PORT ?? "", 10);
-      const port = envPort || PROXY_PORT;
-      if (isNaN(port) || port < 1 || port > 65535) {
-        console.error(`Invalid port: ${process.env.PORT}. Using default ${PROXY_PORT}.`);
-      }
-      await cmdServe(port);
+      await cmdServe(getServePort(), getServeHost());
       break;
     }
     case "status":

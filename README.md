@@ -35,6 +35,7 @@ docker run -p 3000:3000 \
   ghcr.io/egoist/cursor-openai-api:latest login
 docker run -p 3000:3000 \
   -v ~/.config/cursor-openai-api:/home/appuser/.config/cursor-openai-api \
+  -e HOST=0.0.0.0 \
   ghcr.io/egoist/cursor-openai-api:latest serve
 ```
 
@@ -76,16 +77,23 @@ cursor-openai-api models
 
 ### `cursor-openai-api serve`
 
-Start the OpenAI-compatible proxy server. Uses `PORT` environment variable (default: 3000).
+Start the OpenAI-compatible proxy server.
 
 ```bash
-PORT=3000 cursor-openai-api serve
+HOST=127.0.0.1 PORT=3000 cursor-openai-api serve
 ```
+
+Environment variables:
+
+- `HOST` - listen address, default `127.0.0.1`. Use `0.0.0.0` for Docker or LAN access.
+- `PORT` - listen port, default `3000`.
+- `CURSOR_OPENAI_API_KEY` - optional inbound bearer token. When set, requests must include `Authorization: Bearer <token>`.
 
 The server exposes:
 
 - `POST /v1/chat/completions` - Chat completions endpoint
 - `GET /v1/models` - List available models
+- `GET /health` - Health check returning `{ "ok": true, "version": "..." }`
 
 ### `cursor-openai-api status`
 
@@ -101,7 +109,7 @@ cursor-openai-api status
 import OpenAI from "openai"
 
 const client = new OpenAI({
-  apiKey: "cursor", // any non-empty string
+  apiKey: process.env.CURSOR_OPENAI_API_KEY ?? "cursor",
   baseURL: "http://localhost:3000/v1",
 })
 
@@ -110,6 +118,22 @@ const chat = await client.chat.completions.create({
   messages: [{ role: "user", content: "Hello!" }],
 })
 ```
+
+## Hermes Usage
+
+For Hermes or other OpenAI-compatible clients, point the client at the local `/v1` endpoint:
+
+```bash
+CURSOR_OPENAI_API_KEY=local-token cursor-openai-api serve
+```
+
+Use `http://127.0.0.1:3000/v1` as the base URL and send `Authorization: Bearer <token>` when `CURSOR_OPENAI_API_KEY` is configured.
+
+Compatibility notes:
+
+- `developer` messages are accepted for GPT-5-family model requests and are folded into the root prompt with `system` messages in request order.
+- Streaming tool calls are emitted as OpenAI `tool_calls` chunks.
+- Tool call IDs emitted by the proxy are sanitized to `[A-Za-z0-9_-]` so OpenAI clients can safely return them as `tool_call_id` values.
 
 ## Requirements
 

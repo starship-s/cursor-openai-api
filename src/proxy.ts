@@ -73,6 +73,9 @@ import { resolve as pathResolve } from "node:path";
 const CURSOR_API_URL = "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
+const PACKAGE_VERSION = process.env.npm_package_version ?? "0.0.3";
+export const DEFAULT_PROXY_HOST = "127.0.0.1";
+export const INBOUND_API_KEY_ENV = "CURSOR_OPENAI_API_KEY";
 
 // --- Types ---
 
@@ -83,8 +86,8 @@ interface OpenAIToolCall {
 }
 
 interface OpenAIMessage {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  role: "system" | "developer" | "user" | "assistant" | "tool";
+  content?: string | null;
   tool_call_id?: string;
   tool_calls?: OpenAIToolCall[];
 }
@@ -118,7 +121,10 @@ interface CursorRequestPayload {
 interface PendingExec {
   execId: string;
   execMsgId: number;
-  toolCallId: string;
+  /** Cursor's original tool call ID. */
+  cursorToolCallId: string;
+  /** OpenAI-safe ID emitted to clients. */
+  openAIToolCallId: string;
   toolName: string;
   /** Decoded arguments JSON string for SSE tool_calls emission. */
   decodedArgs: string;
@@ -231,24 +237,73 @@ function spawnBridge(accessToken: string): {
 
 // --- Proxy Server ---
 
+function jsonResponse(
+  body: unknown,
+  init: { status?: number; headers?: Record<string, string> } = {},
+): Response {
+  return new Response(JSON.stringify(body), {
+    status: init.status,
+    headers: {
+      ...(init.headers ?? {}),
+      "Content-Type": "application/json",
+    },
+  });
+}
+
+function validateInboundAuth(req: Request): Response | null {
+  const expectedToken = process.env[INBOUND_API_KEY_ENV]?.trim();
+  if (!expectedToken) return null;
+
+  const authorization = req.headers.get("authorization") ?? "";
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  if (match?.[1] === expectedToken) return null;
+
+  return jsonResponse(
+    {
+      error: {
+        message: "Missing or invalid Authorization header",
+        type: "invalid_request_error",
+        code: "invalid_api_key",
+      },
+    },
+    {
+      status: 401,
+      headers: { "WWW-Authenticate": "Bearer" },
+    },
+  );
+}
+
 let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
+let proxyHost: string | undefined;
 
 export function getProxyPort(): number | undefined {
   return proxyPort;
 }
 
+export function getProxyHost(): string | undefined {
+  return proxyHost;
+}
+
 export async function startProxy(
   getAccessToken: () => Promise<string>,
   port: number = 0,
+  host: string = DEFAULT_PROXY_HOST,
 ): Promise<number> {
   if (proxyServer && proxyPort) return proxyPort;
 
   proxyServer = Bun.serve({
     port,
+    hostname: host,
     idleTimeout: 255, // max — Cursor responses can take 30s+
     async fetch(req) {
       const url = new URL(req.url);
+      const authFailure = validateInboundAuth(req);
+      if (authFailure) return authFailure;
+
+      if (req.method === "GET" && url.pathname === "/health") {
+        return jsonResponse({ ok: true, version: PACKAGE_VERSION });
+      }
 
       if (req.method === "GET" && url.pathname === "/v1/models") {
         const accessToken = await getAccessToken();
@@ -289,6 +344,7 @@ export async function startProxy(
   });
 
   proxyPort = proxyServer.port;
+  proxyHost = host;
   if (!proxyPort) throw new Error("Failed to bind proxy to a port");
   return proxyPort;
 }
@@ -298,6 +354,7 @@ export function stopProxy(): void {
     proxyServer.stop();
     proxyServer = undefined;
     proxyPort = undefined;
+    proxyHost = undefined;
   }
   // Clean up any lingering bridges
   for (const [key, active] of activeBridges) {
@@ -370,37 +427,45 @@ interface ParsedMessages {
   toolResults: ToolResultInfo[];
 }
 
+function isRootPromptMessage(msg: OpenAIMessage): boolean {
+  return msg.role === "system" || msg.role === "developer";
+}
+
+function messageContentToText(content: OpenAIMessage["content"]): string {
+  return content ?? "";
+}
+
 function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const pairs: Array<{ userText: string; assistantText: string }> = [];
   const toolResults: ToolResultInfo[] = [];
 
-  // Collect system messages
+  // Collect root prompt messages in request order.
   const systemParts = messages
-    .filter((m) => m.role === "system")
-    .map((m) => m.content ?? "");
+    .filter(isRootPromptMessage)
+    .map((m) => messageContentToText(m.content));
   if (systemParts.length > 0) {
     systemPrompt = systemParts.join("\n");
   }
 
   // Separate tool results from conversation turns
-  const nonSystem = messages.filter((m) => m.role !== "system");
+  const nonSystem = messages.filter((m) => !isRootPromptMessage(m));
   let pendingUser = "";
 
   for (const msg of nonSystem) {
     if (msg.role === "tool") {
       toolResults.push({
         toolCallId: msg.tool_call_id ?? "",
-        content: msg.content ?? "",
+        content: messageContentToText(msg.content),
       });
     } else if (msg.role === "user") {
       if (pendingUser) {
         pairs.push({ userText: pendingUser, assistantText: "" });
       }
-      pendingUser = msg.content ?? "";
+      pendingUser = messageContentToText(msg.content);
     } else if (msg.role === "assistant") {
       // Skip assistant messages that are just tool_calls with no text
-      const text = msg.content ?? "";
+      const text = messageContentToText(msg.content);
       if (pendingUser) {
         pairs.push({ userText: pendingUser, assistantText: text });
         pendingUser = "";
@@ -456,6 +521,11 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
     decoded[key] = decodeMcpArgValue(value);
   }
   return decoded;
+}
+
+export function sanitizeToolCallId(toolCallId: string): string {
+  const safeId = toolCallId.replace(/[^A-Za-z0-9_-]/g, "_");
+  return safeId || "call";
 }
 
 // --- gRPC Request Building ---
@@ -717,10 +787,12 @@ function handleExecMessage(
   if (execCase === "mcpArgs") {
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
+    const cursorToolCallId = mcpArgs.toolCallId || crypto.randomUUID();
     onMcpExec({
       execId: execMsg.execId,
       execMsgId: execMsg.id,
-      toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
+      cursorToolCallId,
+      openAIToolCallId: sanitizeToolCallId(cursorToolCallId),
       toolName: mcpArgs.toolName || mcpArgs.name,
       decodedArgs: JSON.stringify(decoded),
     });
@@ -991,7 +1063,7 @@ function handleStreamingResponse(
                 sendSSE(makeChunk({
                   tool_calls: [{
                     index: toolCallIndex,
-                    id: exec.toolCallId,
+                    id: exec.openAIToolCallId,
                     type: "function",
                     function: {
                       name: exec.toolName,
@@ -1064,7 +1136,9 @@ function handleToolResultResume(
   // Send mcpResult for each pending exec that has a matching tool result
   for (const exec of pendingExecs) {
     const result = toolResults.find(
-      (r) => r.toolCallId === exec.toolCallId,
+      (r) =>
+        r.toolCallId === exec.openAIToolCallId ||
+        r.toolCallId === exec.cursorToolCallId,
     );
     const mcpResult = result
       ? create(McpResultSchema, {
@@ -1209,7 +1283,7 @@ function handleToolResultResume(
                 sendSSE(makeChunk({
                   tool_calls: [{
                     index: toolCallIndex,
-                    id: exec.toolCallId,
+                    id: exec.openAIToolCallId,
                     type: "function",
                     function: {
                       name: exec.toolName,
