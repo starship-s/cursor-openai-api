@@ -1034,16 +1034,14 @@ function handleStreamingResponse(
               // onText
               (text, isThinking) => {
                 if (isThinking) {
-                  if (!state.thinkingActive) {
-                    state.thinkingActive = true;
-                    sendSSE(makeChunk({ role: "assistant", content: "<think>" }));
-                  }
-                  sendSSE(makeChunk({ content: text }));
+                  state.thinkingActive = true;
+                  // Cursor exposes internal thinking separately. Preserve that
+                  // separation on the OpenAI wire instead of wrapping it in
+                  // visible <think> content, which leaks into clients that do
+                  // not run a tag-aware stream scrubber.
+                  sendSSE(makeChunk({ reasoning_content: text }));
                 } else {
-                  if (state.thinkingActive) {
-                    state.thinkingActive = false;
-                    sendSSE(makeChunk({ content: "</think>" }));
-                  }
+                  state.thinkingActive = false;
                   sendSSE(makeChunk({ content: text }));
                 }
               },
@@ -1054,7 +1052,6 @@ function handleStreamingResponse(
 
                 // Close thinking if active
                 if (state.thinkingActive) {
-                  sendSSE(makeChunk({ content: "</think>" }));
                   state.thinkingActive = false;
                 }
 
@@ -1100,7 +1097,7 @@ function handleStreamingResponse(
         if (!mcpExecReceived) {
           // Normal completion — no pending tool calls
           if (state.thinkingActive) {
-            sendSSE(makeChunk({ content: "</think>" }));
+            state.thinkingActive = false;
           }
           sendSSE(makeChunk({}, "stop"));
           sendDone();
@@ -1257,16 +1254,10 @@ function handleToolResultResume(
               state,
               (text, isThinking) => {
                 if (isThinking) {
-                  if (!state.thinkingActive) {
-                    state.thinkingActive = true;
-                    sendSSE(makeChunk({ role: "assistant", content: "<think>" }));
-                  }
-                  sendSSE(makeChunk({ content: text }));
+                  state.thinkingActive = true;
+                  sendSSE(makeChunk({ reasoning_content: text }));
                 } else {
-                  if (state.thinkingActive) {
-                    state.thinkingActive = false;
-                    sendSSE(makeChunk({ content: "</think>" }));
-                  }
+                  state.thinkingActive = false;
                   sendSSE(makeChunk({ content: text }));
                 }
               },
@@ -1275,7 +1266,6 @@ function handleToolResultResume(
                 mcpExecReceived = true;
 
                 if (state.thinkingActive) {
-                  sendSSE(makeChunk({ content: "</think>" }));
                   state.thinkingActive = false;
                 }
 
@@ -1319,7 +1309,7 @@ function handleToolResultResume(
         clearInterval(heartbeatTimer);
         if (!mcpExecReceived) {
           if (state.thinkingActive) {
-            sendSSE(makeChunk({ content: "</think>" }));
+            state.thinkingActive = false;
           }
           sendSSE(makeChunk({}, "stop"));
           sendDone();
@@ -1349,7 +1339,7 @@ function handleNonStreamingResponse(
   const created = Math.floor(Date.now() / 1000);
 
   const responsePromise = collectFullResponse(payload, accessToken).then(
-    (fullText) =>
+    ({ fullText, reasoningText }) =>
       new Response(
         JSON.stringify({
           id: completionId,
@@ -1359,7 +1349,11 @@ function handleNonStreamingResponse(
           choices: [
             {
               index: 0,
-              message: { role: "assistant", content: fullText },
+              message: {
+                role: "assistant",
+                content: fullText,
+                ...(reasoningText ? { reasoning_content: reasoningText } : {}),
+              },
               finish_reason: "stop",
             },
           ],
@@ -1379,9 +1373,13 @@ function handleNonStreamingResponse(
 async function collectFullResponse(
   payload: CursorRequestPayload,
   accessToken: string,
-): Promise<string> {
-  const { promise, resolve } = Promise.withResolvers<string>();
+): Promise<{ fullText: string; reasoningText: string }> {
+  const { promise, resolve } = Promise.withResolvers<{
+    fullText: string;
+    reasoningText: string;
+  }>();
   let fullText = "";
+  let reasoningText = "";
 
   const bridge = spawnBridge(accessToken);
 
@@ -1422,7 +1420,13 @@ async function collectFullResponse(
           payload.mcpTools,
           (data) => bridge.write(data),
           state,
-          (text) => { fullText += text; },
+          (text, isThinking) => {
+            if (isThinking) {
+              reasoningText += text;
+            } else {
+              fullText += text;
+            }
+          },
           () => {},
         );
       } catch {
@@ -1433,7 +1437,7 @@ async function collectFullResponse(
 
   bridge.onClose(() => {
     clearInterval(heartbeatTimer);
-    resolve(fullText);
+    resolve({ fullText, reasoningText });
   });
 
   return promise;

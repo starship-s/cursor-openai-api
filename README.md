@@ -134,6 +134,7 @@ Use `http://127.0.0.1:3000/v1` as the base URL and send `Authorization: Bearer <
 Compatibility notes:
 
 - `developer` messages are accepted for GPT-5-family model requests and are folded into the root prompt with `system` messages in request order.
+- Cursor thinking deltas are emitted as OpenAI-compatible `reasoning_content` deltas instead of visible `<think>` text.
 - Streaming tool calls are emitted as OpenAI `tool_calls` chunks.
 - Tool call IDs emitted by the proxy are sanitized to `[A-Za-z0-9_-]` so OpenAI clients can safely return them as `tool_call_id` values.
 
