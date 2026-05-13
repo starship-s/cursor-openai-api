@@ -3,7 +3,14 @@
  *
  * Serves Cursor API as OpenAI-compatible endpoint with OAuth authentication.
  */
-import { login, logout, getStoredCredentials, isAuthenticated } from "./cli-auth";
+import {
+  getStoredCredentials,
+  isAuthenticated,
+  login,
+  logout,
+  refreshCursorToken,
+  saveCredentials,
+} from "./cli-auth";
 import {
   DEFAULT_PROXY_HOST,
   INBOUND_API_KEY_ENV,
@@ -73,15 +80,28 @@ async function cmdModels() {
   }
 }
 
-async function cmdServe(port: number, host: string) {
+const TOKEN_REFRESH_SAFETY_MS = 60_000;
+
+async function getFreshAccessToken(): Promise<string> {
   const creds = getStoredCredentials();
   if (!creds) {
-    console.log("❌ Not logged in. Run `cursor-api login` first.");
-    process.exit(1);
+    throw new Error("Not logged in. Run `cursor-api login` first.");
   }
 
-  if (creds.expires < Date.now()) {
-    console.log("⚠️  Token expired. Run `cursor-api login` to re-authenticate.");
+  if (creds.expires > Date.now() + TOKEN_REFRESH_SAFETY_MS) {
+    return creds.access;
+  }
+
+  const refreshed = await refreshCursorToken(creds.refresh);
+  saveCredentials(refreshed);
+  return refreshed.access;
+}
+
+async function cmdServe(port: number, host: string) {
+  try {
+    await getFreshAccessToken();
+  } catch (error) {
+    console.log(`❌ ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
 
@@ -92,7 +112,7 @@ async function cmdServe(port: number, host: string) {
   console.log(`   Inbound auth: ${process.env[INBOUND_API_KEY_ENV] ? "required" : "disabled"}`);
   console.log(`   Press Ctrl+C to stop.\n`);
 
-  const proxyPort = await startProxy(async () => creds.access, port, host);
+  const proxyPort = await startProxy(getFreshAccessToken, port, host);
 
   console.log(`✅ Server running at http://${host}:${proxyPort}\n`);
 

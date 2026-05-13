@@ -89,6 +89,8 @@ Environment variables:
 - `PORT` - listen port, default `3000`.
 - `CURSOR_OPENAI_API_KEY` - optional inbound bearer token. When set, requests must include `Authorization: Bearer <token>`.
 
+The server refreshes stored Cursor OAuth credentials as needed while it is running.
+
 The server exposes:
 
 - `POST /v1/chat/completions` - Chat completions endpoint
