@@ -19,6 +19,9 @@ const CURSOR_CLIENT_VERSION = "cli-2026.02.13-41ac335";
 const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
+// Cursor docs list GPT-5.5 normal context as 272K. Max Mode (1M) is a
+// separate request option and should not be advertised unless explicitly set.
+const GPT_55_CONTEXT_WINDOW = 272_000;
 const DEFAULT_MAX_TOKENS = 64_000;
 
 // --- Zod schemas for safe parsing of gRPC response ---
@@ -246,9 +249,14 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
     id,
     name: pickDisplayName(details, id),
     reasoning: Boolean(details.thinkingDetails),
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    contextWindow: inferContextWindow(id),
     maxTokens: DEFAULT_MAX_TOKENS,
   };
+}
+
+function inferContextWindow(modelId: string): number {
+  if (modelId.startsWith("gpt-5.5")) return GPT_55_CONTEXT_WINDOW;
+  return DEFAULT_CONTEXT_WINDOW;
 }
 
 function pickDisplayName(model: CursorModelDetails, fallbackId: string): string {
