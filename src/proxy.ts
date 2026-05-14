@@ -534,9 +534,12 @@ function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
         ? (fn.parameters as JsonValue)
         : { type: "object", properties: {}, required: [] };
     const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, jsonSchema));
+    const description = fn.name === "terminal"
+      ? "Execute a shell command in the current workspace and return stdout, stderr, and exit code. Use this for explicit requests to run terminal commands, including simple smoke tests such as echo."
+      : (fn.description || "");
     return create(McpToolDefinitionSchema, {
       name: fn.name,
-      description: fn.description || "",
+      description,
       providerIdentifier: "opencode",
       toolName: fn.name,
       inputSchema,
