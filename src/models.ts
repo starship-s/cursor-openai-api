@@ -43,6 +43,37 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   // which is DEFAULT_CONTEXT_WINDOW, so no explicit entry needed.
 };
 
+/**
+ * Max completion tokens per model family, sourced from provider API docs
+ * and Cursor's official model pages.
+ *
+ * Key (prefix) → max output tokens in normal mode.
+ * Models not in this map fall back to DEFAULT_MAX_TOKENS (64K).
+ */
+const MODEL_MAX_TOKENS: Record<string, number> = {
+  // OpenAI GPT-5 family — 128K max output
+  "gpt-5":       128_000,
+  "gpt-5.1":     128_000,
+  "gpt-5.2":     128_000,
+  "gpt-5.3":     128_000,
+  "gpt-5.4":     128_000,
+  "gpt-5.5":     128_000,
+  // Anthropic Claude 4.6+ — 128K max output (extended thinking / batch)
+  "claude-4.6":  128_000,
+  "claude-opus-4-7": 128_000,
+  "claude-4-6":  128_000,
+  // Anthropic Claude 4.5 — 64K max output (older generation)
+  "claude-4.5":  64_000,
+  "claude-4-sonnet": 64_000,
+  "claude-4-sonnet-thinking": 64_000,
+  // Google Gemini — 65,536 max output
+  "gemini-3":    65_536,
+  // xAI Grok — 131,072 max output
+  "grok-4":      131_072,
+  // Kimi K2.5 — 262,144 (can use full context as output)
+  "kimi-k2.5":   262_144,
+};
+
 // --- Zod schemas for safe parsing of gRPC response ---
 
 const CursorModelDetailsSchema = z.object({
@@ -269,24 +300,32 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
     name: pickDisplayName(details, id),
     reasoning: Boolean(details.thinkingDetails),
     contextWindow: inferContextWindow(id),
-    maxTokens: DEFAULT_MAX_TOKENS,
+    maxTokens: inferMaxTokens(id),
   };
 }
 
+function inferMaxTokens(modelId: string): number {
+  return inferFromTable(modelId, MODEL_MAX_TOKENS, DEFAULT_MAX_TOKENS);
+}
+
 function inferContextWindow(modelId: string): number {
-  // Try longest prefix match first (e.g. "gpt-5.4-mini-high" matches "gpt-5.4" not "gpt-5").
-  const sortedPrefixes = Object.keys(MODEL_CONTEXT_WINDOWS).sort(
+  return inferFromTable(modelId, MODEL_CONTEXT_WINDOWS, DEFAULT_CONTEXT_WINDOW);
+}
+
+/**
+ * Longest-prefix match against a model-family table.
+ * E.g. "gpt-5.4-mini-high" matches "gpt-5.4" before "gpt-5".
+ */
+function inferFromTable(modelId: string, table: Record<string, number>, fallback: number): number {
+  const sortedPrefixes = Object.keys(table).sort(
     (a, b) => b.length - a.length,
   );
   for (const prefix of sortedPrefixes) {
     if (modelId === prefix || modelId.startsWith(prefix + "-") || modelId.startsWith(prefix + ".")) {
-      return MODEL_CONTEXT_WINDOWS[prefix]!;
+      return table[prefix]!;
     }
   }
-  // Special case: "gpt-5-mini", "gpt-5-fast" etc. where suffix starts with "-"
-  // already covered by startsWith("gpt-5-") above.
-  // "gpt-5" itself is an exact match above.
-  return DEFAULT_CONTEXT_WINDOW;
+  return fallback;
 }
 
 function pickDisplayName(model: CursorModelDetails, fallbackId: string): string {
