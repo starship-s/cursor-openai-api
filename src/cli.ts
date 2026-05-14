@@ -81,18 +81,31 @@ async function cmdModels() {
 }
 
 const TOKEN_REFRESH_SAFETY_MS = 60_000;
+const UPSTREAM_CURSOR_API_KEY_ENV = "CURSOR_API_KEY";
 
 async function getFreshAccessToken(): Promise<string> {
   const creds = getStoredCredentials();
-  if (!creds) {
-    throw new Error("Not logged in. Run `cursor-api login` first.");
-  }
+  const upstreamApiKey = process.env[UPSTREAM_CURSOR_API_KEY_ENV]?.trim();
 
-  if (creds.expires > Date.now() + TOKEN_REFRESH_SAFETY_MS) {
+  if (creds && creds.expires > Date.now() + TOKEN_REFRESH_SAFETY_MS) {
     return creds.access;
   }
 
-  const refreshed = await refreshCursorToken(creds.refresh);
+  const exchangeCredential = upstreamApiKey || creds?.refresh;
+  if (!exchangeCredential) {
+    throw new Error(
+      `Not logged in. Run \`cursor-api login\` first or set ${UPSTREAM_CURSOR_API_KEY_ENV}.`,
+    );
+  }
+
+  const refreshed = await refreshCursorToken(exchangeCredential);
+  if (upstreamApiKey) {
+    // Cursor's exchange_user_api_key endpoint currently returns short-lived
+    // api_key_token JWTs for both accessToken and refreshToken. Preserve the
+    // original durable user API key so long-running serve processes can keep
+    // exchanging it after the one-hour JWT expires.
+    refreshed.refresh = upstreamApiKey;
+  }
   saveCredentials(refreshed);
   return refreshed.access;
 }

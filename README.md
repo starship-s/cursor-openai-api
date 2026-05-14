@@ -87,9 +87,10 @@ Environment variables:
 
 - `HOST` - listen address, default `127.0.0.1`. Use `0.0.0.0` for Docker or LAN access.
 - `PORT` - listen port, default `3000`.
-- `CURSOR_OPENAI_API_KEY` - optional inbound bearer token. When set, requests must include `Authorization: Bearer <token>`.
+- `CURSOR_OPENAI_API_KEY` - optional inbound bearer token. When set, requests must include `Authorization: Bearer YOUR_TOKEN`.
+- `CURSOR_API_KEY` - optional upstream Cursor user API key. When set, the server exchanges it for fresh short-lived Cursor API tokens as needed; useful for long-running services because Cursor's returned API-token JWTs expire in about an hour.
 
-The server refreshes stored Cursor OAuth credentials as needed while it is running.
+The server refreshes stored Cursor OAuth credentials as needed while it is running. For persistent/systemd deployments, prefer setting `CURSOR_API_KEY` so refreshes do not depend on a short-lived stored token.
 
 The server exposes:
 
