@@ -408,7 +408,13 @@ function handleChatCompletion(
     activeBridges.delete(bridgeKey);
   }
 
-  const mcpTools = buildMcpToolDefinitions(tools);
+  let toolsForCursor = tools;
+  const asksForTerminal = /\b(terminal|shell|command|echo)\b/i.test(userText);
+  const terminalTool = tools.find((tool) => tool.function.name === "terminal");
+  if (asksForTerminal && terminalTool) {
+    toolsForCursor = [terminalTool];
+  }
+  const mcpTools = buildMcpToolDefinitions(toolsForCursor);
   const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
   payload.mcpTools = mcpTools;
 
@@ -527,7 +533,14 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
 
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
-  return tools.map((t) => {
+  const sortedTools = [...tools].sort((a, b) => {
+    const an = a.function.name;
+    const bn = b.function.name;
+    if (an === "terminal" && bn !== "terminal") return -1;
+    if (bn === "terminal" && an !== "terminal") return 1;
+    return 0;
+  });
+  return sortedTools.map((t) => {
     const fn = t.function;
     const jsonSchema: JsonValue =
       fn.parameters && typeof fn.parameters === "object"
