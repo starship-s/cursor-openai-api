@@ -442,10 +442,24 @@ function messageContentToText(content: OpenAIMessage["content"]): string {
   return content ?? "";
 }
 
+function formatAssistantMessageForHistory(msg: OpenAIMessage): string {
+  const parts: string[] = [];
+  const text = messageContentToText(msg.content).trim();
+  if (text) parts.push(text);
+  for (const call of msg.tool_calls ?? []) {
+    parts.push(`[Tool call: ${call.function.name} arguments=${call.function.arguments}]`);
+  }
+  return parts.join("\n");
+}
+
+function appendHistoryPart(turn: { userText: string; assistantText: string }, part: string): void {
+  const trimmed = part.trim();
+  if (!trimmed) return;
+  turn.assistantText = turn.assistantText ? `${turn.assistantText}\n${trimmed}` : trimmed;
+}
+
 function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
-  const pairs: Array<{ userText: string; assistantText: string }> = [];
-  const toolResults: ToolResultInfo[] = [];
 
   // Collect root prompt messages in request order.
   const systemParts = messages
@@ -455,40 +469,58 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     systemPrompt = systemParts.join("\n");
   }
 
-  // Separate tool results from conversation turns
   const nonSystem = messages.filter((m) => !isRootPromptMessage(m));
-  let pendingUser = "";
 
-  for (const msg of nonSystem) {
-    if (msg.role === "tool") {
+  // OpenAI tool-result continuation requests end with one or more `tool` messages.
+  // Only those trailing tool messages should resume an active bridge. Historical
+  // tool messages from previous turns are conversation history, not new results.
+  const toolResults: ToolResultInfo[] = [];
+  let trailingToolStart = nonSystem.length;
+  while (trailingToolStart > 0 && nonSystem[trailingToolStart - 1]?.role === "tool") {
+    trailingToolStart -= 1;
+  }
+  if (trailingToolStart < nonSystem.length) {
+    for (const msg of nonSystem.slice(trailingToolStart)) {
       toolResults.push({
         toolCallId: msg.tool_call_id ?? "",
         content: messageContentToText(msg.content),
       });
-    } else if (msg.role === "user") {
-      if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: "" });
-      }
-      pendingUser = messageContentToText(msg.content);
-    } else if (msg.role === "assistant") {
-      // Skip assistant messages that are just tool_calls with no text
-      const text = messageContentToText(msg.content);
-      if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: text });
-        pendingUser = "";
-      }
     }
   }
 
-  let lastUserText = "";
-  if (pendingUser) {
-    lastUserText = pendingUser;
-  } else if (pairs.length > 0 && toolResults.length === 0) {
-    const last = pairs.pop()!;
-    lastUserText = last.userText;
-  }
+  // For ordinary chat-completion turns, the final user message is the current
+  // prompt and every prior message is history. Preserve assistant tool calls and
+  // tool results in that history; otherwise Cursor only sees the first assistant
+  // text after each user and misses later same-turn actions like Jira creation.
+  const lastUserIndex = nonSystem.map((m) => m.role).lastIndexOf("user");
+  const userText = lastUserIndex >= 0 ? messageContentToText(nonSystem[lastUserIndex].content) : "";
+  const historyMessages = lastUserIndex >= 0 ? nonSystem.slice(0, lastUserIndex) : nonSystem.slice(0, trailingToolStart);
 
-  return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
+  const turns: Array<{ userText: string; assistantText: string }> = [];
+  let currentTurn: { userText: string; assistantText: string } | null = null;
+  const flushTurn = () => {
+    if (currentTurn && (currentTurn.userText.trim() || currentTurn.assistantText.trim())) {
+      turns.push(currentTurn);
+    }
+    currentTurn = null;
+  };
+
+  for (const msg of historyMessages) {
+    if (msg.role === "user") {
+      flushTurn();
+      currentTurn = { userText: messageContentToText(msg.content), assistantText: "" };
+    } else if (msg.role === "assistant") {
+      if (!currentTurn) currentTurn = { userText: "", assistantText: "" };
+      appendHistoryPart(currentTurn, formatAssistantMessageForHistory(msg));
+    } else if (msg.role === "tool") {
+      if (!currentTurn) currentTurn = { userText: "", assistantText: "" };
+      const toolName = msg.tool_call_id ? ` id=${msg.tool_call_id}` : "";
+      appendHistoryPart(currentTurn, `[Tool result${toolName}: ${messageContentToText(msg.content)}]`);
+    }
+  }
+  flushTurn();
+
+  return { systemPrompt, userText, turns, toolResults };
 }
 
 // --- MCP Tool Definitions ---
