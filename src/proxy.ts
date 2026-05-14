@@ -544,15 +544,16 @@ function buildCursorRequest(
 ): CursorRequestPayload {
   const blobStore = new Map<string, Uint8Array>();
 
+  const turnBytesList: Uint8Array[] = [];
   const turnBlobIds: Uint8Array[] = [];
   for (const turn of turns) {
     const userMsg = create(UserMessageSchema, {
       text: turn.userText,
       messageId: crypto.randomUUID(),
     });
-    const userMsgBlobId = putBlob(blobStore, toBinary(UserMessageSchema, userMsg));
+    const userMsgBytes = toBinary(UserMessageSchema, userMsg);
 
-    const stepBlobIds: Uint8Array[] = [];
+    const stepBytes: Uint8Array[] = [];
     if (turn.assistantText) {
       const step = create(ConversationStepSchema, {
         message: {
@@ -560,26 +561,40 @@ function buildCursorRequest(
           value: create(AssistantMessageSchema, { text: turn.assistantText }),
         },
       });
-      stepBlobIds.push(putBlob(blobStore, toBinary(ConversationStepSchema, step)));
+      stepBytes.push(toBinary(ConversationStepSchema, step));
     }
 
     const agentTurn = create(AgentConversationTurnStructureSchema, {
-      userMessage: userMsgBlobId,
-      steps: stepBlobIds,
+      userMessage: userMsgBytes,
+      steps: stepBytes,
     });
     const turnStructure = create(ConversationTurnStructureSchema, {
       turn: { case: "agentConversationTurn", value: agentTurn },
     });
-    turnBlobIds.push(putBlob(blobStore, toBinary(ConversationTurnStructureSchema, turnStructure)));
+    const turnBytes = toBinary(ConversationTurnStructureSchema, turnStructure);
+    turnBytesList.push(turnBytes);
+    turnBlobIds.push(putBlob(blobStore, turnBytes));
   }
 
-  // Conversation structure fields store blob IDs. Cursor requests the bytes back
-  // via the KV handshake while hydrating prior turns.
-  const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
+  // Cursor currently has two history fields: legacy turns_old stores serialized
+  // ConversationTurnStructure bytes inline, while newer turns is fetched via the
+  // KV/blob handshake by some server paths. Populate both so history hydrates
+  // across model/protocol variants without reintroducing Blob-not-found errors.
+  const historyText = turns.length
+    ? `\n\nConversation history provided by the OpenAI-compatible client:\n${turns
+        .map((turn, index) => {
+          const assistant = turn.assistantText ? `\nAssistant: ${turn.assistantText}` : "";
+          return `Turn ${index + 1}:\nUser: ${turn.userText}${assistant}`;
+        })
+        .join("\n\n")}\n\nUse the conversation history above when answering the next user message.`
+    : "";
+  const effectiveSystemPrompt = `${systemPrompt}${historyText}`;
+  const systemJson = JSON.stringify({ role: "system", content: effectiveSystemPrompt });
   const systemBytes = new TextEncoder().encode(systemJson);
   const systemBlobId = putBlob(blobStore, systemBytes);
 
   const conversationState = create(ConversationStateStructureSchema, {
+    turnsOld: turnBytesList,
     rootPromptMessagesJson: [systemBlobId],
     turns: turnBlobIds,
     todos: [],
@@ -594,8 +609,11 @@ function buildCursorRequest(
     readPaths: [],
   });
 
+  const effectiveUserText = historyText
+    ? `${historyText}\n\nCurrent user message:\n${userText}`
+    : userText;
   const userMessage = create(UserMessageSchema, {
-    text: userText,
+    text: effectiveUserText,
     messageId: crypto.randomUUID(),
   });
   const action = create(ConversationActionSchema, {
