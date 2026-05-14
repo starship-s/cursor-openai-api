@@ -316,6 +316,11 @@ export async function startProxy(
           permission: [],
           root: m.id,
           parent: null,
+          // Non-standard but widely used by OpenAI-compatible clients,
+          // including Hermes, to size context compression thresholds.
+          context_length: m.contextWindow,
+          context_window: m.contextWindow,
+          max_completion_tokens: m.maxTokens,
         }));
         return new Response(
           JSON.stringify({ object: "list", data: openAIModels }),
