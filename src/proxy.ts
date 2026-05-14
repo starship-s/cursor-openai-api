@@ -412,7 +412,9 @@ function handleChatCompletion(
   const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
   payload.mcpTools = mcpTools;
 
-  if (body.stream === false) {
+  // OpenAI convention: absent/null/undefined stream field = non-streaming.
+  // Only streaming when stream is explicitly true.
+  if (body.stream !== true) {
     return handleNonStreamingResponse(payload, accessToken, modelId);
   }
   return handleStreamingResponse(payload, accessToken, modelId, bridgeKey);
