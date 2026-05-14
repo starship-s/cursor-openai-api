@@ -19,10 +19,29 @@ const CURSOR_CLIENT_VERSION = "cli-2026.02.13-41ac335";
 const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
-// Cursor docs list GPT-5.5 normal context as 272K. Max Mode (1M) is a
-// separate request option and should not be advertised unless explicitly set.
-const GPT_55_CONTEXT_WINDOW = 272_000;
 const DEFAULT_MAX_TOKENS = 64_000;
+
+/**
+ * Context windows per model family, sourced from Cursor's official model docs.
+ * Max Mode (1M/2M) is a separate request option and NOT advertised here —
+ * normal-mode context only.
+ *
+ * Key (prefix) → normal context window in tokens.
+ * Models not in this map fall back to DEFAULT_CONTEXT_WINDOW (200K).
+ */
+const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+  // OpenAI GPT-5 family — 272K normal, 1M Max Mode for GPT-5.4 and GPT-5.5
+  "gpt-5":       272_000,
+  "gpt-5.1":     272_000,
+  "gpt-5.2":     272_000,
+  "gpt-5.3":     272_000,
+  "gpt-5.4":     272_000,
+  "gpt-5.5":     272_000,
+  // Kimi K2.5 — 262K normal, no Max Mode
+  "kimi-k2.5":   262_000,
+  // Everything else (Claude, Gemini, Grok, Composer, Cursor default) = 200K
+  // which is DEFAULT_CONTEXT_WINDOW, so no explicit entry needed.
+};
 
 // --- Zod schemas for safe parsing of gRPC response ---
 
@@ -255,7 +274,18 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
 }
 
 function inferContextWindow(modelId: string): number {
-  if (modelId.startsWith("gpt-5.5")) return GPT_55_CONTEXT_WINDOW;
+  // Try longest prefix match first (e.g. "gpt-5.4-mini-high" matches "gpt-5.4" not "gpt-5").
+  const sortedPrefixes = Object.keys(MODEL_CONTEXT_WINDOWS).sort(
+    (a, b) => b.length - a.length,
+  );
+  for (const prefix of sortedPrefixes) {
+    if (modelId === prefix || modelId.startsWith(prefix + "-") || modelId.startsWith(prefix + ".")) {
+      return MODEL_CONTEXT_WINDOWS[prefix]!;
+    }
+  }
+  // Special case: "gpt-5-mini", "gpt-5-fast" etc. where suffix starts with "-"
+  // already covered by startsWith("gpt-5-") above.
+  // "gpt-5" itself is an exact match above.
   return DEFAULT_CONTEXT_WINDOW;
 }
 
