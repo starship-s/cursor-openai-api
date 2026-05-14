@@ -530,6 +530,12 @@ export function sanitizeToolCallId(toolCallId: string): string {
 
 // --- gRPC Request Building ---
 
+function putBlob(blobStore: Map<string, Uint8Array>, blobData: Uint8Array): Uint8Array {
+  const blobId = new Uint8Array(createHash("sha256").update(blobData).digest());
+  blobStore.set(Buffer.from(blobId).toString("hex"), blobData);
+  return blobId;
+}
+
 function buildCursorRequest(
   modelId: string,
   systemPrompt: string,
@@ -538,15 +544,15 @@ function buildCursorRequest(
 ): CursorRequestPayload {
   const blobStore = new Map<string, Uint8Array>();
 
-  const turnBytes: Uint8Array[] = [];
+  const turnBlobIds: Uint8Array[] = [];
   for (const turn of turns) {
     const userMsg = create(UserMessageSchema, {
       text: turn.userText,
       messageId: crypto.randomUUID(),
     });
-    const userMsgBytes = toBinary(UserMessageSchema, userMsg);
+    const userMsgBlobId = putBlob(blobStore, toBinary(UserMessageSchema, userMsg));
 
-    const stepBytes: Uint8Array[] = [];
+    const stepBlobIds: Uint8Array[] = [];
     if (turn.assistantText) {
       const step = create(ConversationStepSchema, {
         message: {
@@ -554,30 +560,28 @@ function buildCursorRequest(
           value: create(AssistantMessageSchema, { text: turn.assistantText }),
         },
       });
-      stepBytes.push(toBinary(ConversationStepSchema, step));
+      stepBlobIds.push(putBlob(blobStore, toBinary(ConversationStepSchema, step)));
     }
 
     const agentTurn = create(AgentConversationTurnStructureSchema, {
-      userMessage: userMsgBytes,
-      steps: stepBytes,
+      userMessage: userMsgBlobId,
+      steps: stepBlobIds,
     });
     const turnStructure = create(ConversationTurnStructureSchema, {
       turn: { case: "agentConversationTurn", value: agentTurn },
     });
-    turnBytes.push(toBinary(ConversationTurnStructureSchema, turnStructure));
+    turnBlobIds.push(putBlob(blobStore, toBinary(ConversationTurnStructureSchema, turnStructure)));
   }
 
-  // System prompt → blob store (Cursor requests it back via KV handshake)
+  // Conversation structure fields store blob IDs. Cursor requests the bytes back
+  // via the KV handshake while hydrating prior turns.
   const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
   const systemBytes = new TextEncoder().encode(systemJson);
-  const systemBlobId = new Uint8Array(
-    createHash("sha256").update(systemBytes).digest(),
-  );
-  blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
+  const systemBlobId = putBlob(blobStore, systemBytes);
 
   const conversationState = create(ConversationStateStructureSchema, {
     rootPromptMessagesJson: [systemBlobId],
-    turns: turnBytes,
+    turns: turnBlobIds,
     todos: [],
     pendingToolCalls: [],
     previousWorkspaceUris: [],
