@@ -408,12 +408,7 @@ function handleChatCompletion(
     activeBridges.delete(bridgeKey);
   }
 
-  let toolsForCursor = tools;
-  const asksForTerminal = /\b(terminal|shell|command|echo)\b/i.test(userText);
-  const terminalTool = tools.find((tool) => tool.function.name === "terminal");
-  if (asksForTerminal && terminalTool) {
-    toolsForCursor = [terminalTool];
-  }
+  const toolsForCursor = selectToolsForCursor(tools, userText);
   const mcpTools = buildMcpToolDefinitions(toolsForCursor);
   const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
   payload.mcpTools = mcpTools;
@@ -530,6 +525,81 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
 }
 
 // --- MCP Tool Definitions ---
+
+function toolText(tool: OpenAIToolDef): string {
+  const fn = tool.function;
+  return `${fn.name}\n${fn.description ?? ""}`.toLowerCase();
+}
+
+function addToolIfPresent(
+  selected: Map<string, OpenAIToolDef>,
+  toolsByName: Map<string, OpenAIToolDef>,
+  name: string,
+): void {
+  const tool = toolsByName.get(name);
+  if (tool) selected.set(name, tool);
+}
+
+function addToolsMatching(
+  selected: Map<string, OpenAIToolDef>,
+  tools: OpenAIToolDef[],
+  predicate: (name: string, text: string) => boolean,
+  limit = 12,
+): void {
+  for (const tool of tools) {
+    if (selected.size >= limit) break;
+    const name = tool.function.name;
+    if (selected.has(name)) continue;
+    if (predicate(name.toLowerCase(), toolText(tool))) selected.set(name, tool);
+  }
+}
+
+function selectToolsForCursor(tools: OpenAIToolDef[], userText: string): OpenAIToolDef[] {
+  if (tools.length <= 12) return tools;
+
+  const query = userText.toLowerCase();
+  const selected = new Map<string, OpenAIToolDef>();
+  const toolsByName = new Map(tools.map((tool) => [tool.function.name, tool]));
+
+  const addCore = (...names: string[]) => names.forEach((name) => addToolIfPresent(selected, toolsByName, name));
+
+  if (/\b(terminal|shell|command|echo|curl|npm|python|git|systemctl|journalctl|bw\b|bitwarden|token|credential|auth|api key|secret)\b/i.test(userText)) {
+    addCore("terminal", "process", "read_file", "search_files");
+  }
+
+  if (/\b(skill|skills|skillset|runbook|procedure)\b/i.test(userText)) {
+    addCore("skills_list", "skill_view", "skill_manage", "search_files", "read_file", "terminal");
+  }
+
+  if (/\b(jira|atlassian|ticket|issue|jql)\b/i.test(userText)) {
+    addCore("skill_view", "skills_list", "terminal");
+    addToolsMatching(selected, tools, (name, text) => name.includes("jira") || text.includes("jira") || text.includes("atlassian"), 14);
+  }
+
+  if (/\b(bitbucket|pull request|\bpr\b|branch|pipeline|commit)\b/i.test(userText)) {
+    addToolsMatching(selected, tools, (name, text) => name.includes("bitbucket") || text.includes("bitbucket") || text.includes("pull request"), 14);
+  }
+
+  if (/\b(search|web|current|official|docs?|documentation|available|published|research|look up|verify)\b/i.test(userText)) {
+    addCore("web_search", "mcp_kagi_Kagi_search", "mcp_context7_context7_resolve_library_id", "mcp_context7_context7_query_docs");
+    addToolsMatching(selected, tools, (name, text) => name.includes("kagi") || name.includes("context7") || text.includes("web search"), 14);
+  }
+
+  if (/\b(file|read|open|grep|find|search workspace|workspace|patch|edit|write|create\s+(?:a\s+)?file)\b/i.test(userText)) {
+    addCore("search_files", "read_file", "write_file", "patch", "terminal");
+  }
+
+  if (/\b(database|postgres|sql|query|table|violation|filed|count)\b/i.test(userText)) {
+    addToolsMatching(selected, tools, (name, text) => name.includes("postgres") || text.includes("sql") || text.includes("database"), 14);
+    addCore("search_files", "read_file");
+  }
+
+  if (selected.size === 0) return tools;
+
+  // Keep the catalog small enough for Cursor to reliably choose tools, but
+  // retain enough adjacent tools for multi-step workflows.
+  return [...selected.values()].slice(0, 14);
+}
 
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
