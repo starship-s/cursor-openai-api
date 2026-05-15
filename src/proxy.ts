@@ -409,8 +409,17 @@ function handleChatCompletion(
   }
 
   const toolsForCursor = selectToolsForCursor(tools, userText);
+  const selectedToolNames = toolsForCursor.map((t) => t.function.name);
+  let userTextForCursor = userText;
+  if (
+    selectedToolNames.includes("terminal") &&
+    /\b(pr|pull request|review|repo|repository|github|git|branch|checkout|fetch|remote)\b/i.test(userText) &&
+    !/git status\s+--short\s+--branch/i.test(userText)
+  ) {
+    userTextForCursor = `${userText}\n\nBegin by using the terminal tool to run: pwd && git status --short --branch && git remote -v . Then use that output to locate the relevant PR or branch for review context. Continue using available tools until you either identify/pull the review context or hit a concrete blocker such as missing private PR metadata. Do not stop after merely describing the next step.`;
+  }
   const mcpTools = buildMcpToolDefinitions(toolsForCursor);
-  const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
+  const payload = buildCursorRequest(modelId, systemPrompt, userTextForCursor, turns);
   payload.mcpTools = mcpTools;
 
   // OpenAI convention: absent/null/undefined stream field = non-streaming.
@@ -574,6 +583,11 @@ function selectToolsForCursor(tools: OpenAIToolDef[], userText: string): OpenAIT
   if (/\b(jira|atlassian|ticket|issue|jql)\b/i.test(userText)) {
     addCore("skill_view", "skills_list", "terminal");
     addToolsMatching(selected, tools, (name, text) => name.includes("jira") || text.includes("jira") || text.includes("atlassian"), 14);
+  }
+
+  if (/\b(pr|pull request|review|repo|repository|github|git|branch|checkout|fetch|remote)\b/i.test(userText)) {
+    addCore("terminal", "process", "search_files", "read_file", "session_search");
+    addToolsMatching(selected, tools, (name, text) => name.includes("bitbucket") || text.includes("bitbucket") || text.includes("github") || text.includes("pull request"), 14);
   }
 
   if (/\b(bitbucket|pull request|\bpr\b|branch|pipeline|commit)\b/i.test(userText)) {
