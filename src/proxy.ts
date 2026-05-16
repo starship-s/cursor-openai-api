@@ -137,6 +137,7 @@ interface ActiveBridge {
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
+  bridgeKeys: string[];
   /** Resolve function to resume streaming after tool results are sent. */
   onResume: ((sendFrame: (data: Uint8Array) => void) => void) | null;
 }
@@ -145,6 +146,37 @@ interface ActiveBridge {
 // When tool_calls are returned, the bridge stays alive. The next request
 // with tool results looks up the bridge and sends mcpResult messages.
 const activeBridges = new Map<string, ActiveBridge>();
+
+function upsertActiveBridgeKeys(active: ActiveBridge): void {
+  for (const key of active.bridgeKeys) {
+    if (activeBridges.get(key) === active) activeBridges.delete(key);
+  }
+  const keys = [...new Set(active.pendingExecs.flatMap((exec) => [
+    exec.openAIToolCallId,
+    exec.cursorToolCallId,
+  ].filter(Boolean)))];
+  active.bridgeKeys = keys;
+  for (const key of keys) activeBridges.set(key, active);
+}
+
+function removeActiveBridge(active: ActiveBridge, closeBridge = false): void {
+  for (const key of active.bridgeKeys) {
+    if (activeBridges.get(key) === active) activeBridges.delete(key);
+  }
+  active.bridgeKeys = [];
+  if (closeBridge) {
+    clearInterval(active.heartbeatTimer);
+    active.bridge.end();
+  }
+}
+
+function findActiveBridgeForToolResults(toolResults: ToolResultInfo[]): ActiveBridge | undefined {
+  for (const result of toolResults) {
+    const active = activeBridges.get(result.toolCallId);
+    if (active) return active;
+  }
+  return undefined;
+}
 
 // --- H2 Bridge IPC ---
 
@@ -362,10 +394,8 @@ export function stopProxy(): void {
     proxyHost = undefined;
   }
   // Clean up any lingering bridges
-  for (const [key, active] of activeBridges) {
-    clearInterval(active.heartbeatTimer);
-    active.bridge.end();
-    activeBridges.delete(key);
+  for (const active of new Set(activeBridges.values())) {
+    removeActiveBridge(active, true);
   }
 }
 
@@ -375,7 +405,7 @@ function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
 ): Response {
-  const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
+  let { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
   const tools = body.tools ?? [];
 
@@ -391,21 +421,18 @@ function handleChatCompletion(
     );
   }
 
-  // Check for an active bridge waiting for tool results
-  const bridgeKey = deriveBridgeKey(modelId, body.messages);
-  const activeBridge = activeBridges.get(bridgeKey);
+  if (toolResults.length > 0) {
+    const activeBridge = findActiveBridgeForToolResults(toolResults);
+    if (activeBridge) {
+      // Resume an existing bridge with tool results.
+      removeActiveBridge(activeBridge, false);
+      return handleToolResultResume(activeBridge, toolResults, modelId);
+    }
 
-  if (activeBridge && toolResults.length > 0) {
-    // Resume an existing bridge with tool results
-    activeBridges.delete(bridgeKey);
-    return handleToolResultResume(activeBridge, toolResults, modelId, tools, accessToken, bridgeKey);
-  }
-
-  // Clean up stale bridge if present
-  if (activeBridge) {
-    clearInterval(activeBridge.heartbeatTimer);
-    activeBridge.bridge.end();
-    activeBridges.delete(bridgeKey);
+    // No active bridge matched the trailing tool results. Fall back to a fresh
+    // request, but preserve the same-turn assistant/tool activity inside the
+    // prompt so we do not silently drop context.
+    ({ systemPrompt, userText, turns } = parseMessages(body.messages, false));
   }
 
   const toolsForCursor = selectToolsForCursor(tools, userText);
@@ -427,7 +454,7 @@ function handleChatCompletion(
   if (body.stream !== true) {
     return handleNonStreamingResponse(payload, accessToken, modelId);
   }
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey);
+  return handleStreamingResponse(payload, accessToken, modelId);
 }
 
 // --- Message Parsing ---
@@ -468,7 +495,7 @@ function appendHistoryPart(turn: { userText: string; assistantText: string }, pa
   turn.assistantText = turn.assistantText ? `${turn.assistantText}\n${trimmed}` : trimmed;
 }
 
-function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
+function parseMessages(messages: OpenAIMessage[], treatTrailingToolsAsResults = true): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
 
   // Collect root prompt messages in request order.
@@ -489,7 +516,7 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   while (trailingToolStart > 0 && nonSystem[trailingToolStart - 1]?.role === "tool") {
     trailingToolStart -= 1;
   }
-  if (trailingToolStart < nonSystem.length) {
+  if (treatTrailingToolsAsResults && trailingToolStart < nonSystem.length) {
     for (const msg of nonSystem.slice(trailingToolStart)) {
       toolResults.push({
         toolCallId: msg.tool_call_id ?? "",
@@ -503,8 +530,25 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   // tool results in that history; otherwise Cursor only sees the first assistant
   // text after each user and misses later same-turn actions like Jira creation.
   const lastUserIndex = nonSystem.map((m) => m.role).lastIndexOf("user");
-  const userText = lastUserIndex >= 0 ? messageContentToText(nonSystem[lastUserIndex].content) : "";
+  let userText = lastUserIndex >= 0 ? messageContentToText(nonSystem[lastUserIndex].content) : "";
   const historyMessages = lastUserIndex >= 0 ? nonSystem.slice(0, lastUserIndex) : nonSystem.slice(0, trailingToolStart);
+
+  if (!treatTrailingToolsAsResults && lastUserIndex >= 0) {
+    const sameTurnParts = nonSystem.slice(lastUserIndex + 1).flatMap((msg) => {
+      if (msg.role === "assistant") {
+        const part = formatAssistantMessageForHistory(msg);
+        return part ? [part] : [];
+      }
+      if (msg.role === "tool") {
+        const toolName = msg.tool_call_id ? ` id=${msg.tool_call_id}` : "";
+        return [`[Tool result${toolName}: ${messageContentToText(msg.content)}]`];
+      }
+      return [];
+    });
+    if (sameTurnParts.length > 0) {
+      userText = `${userText}\n\nContinue from the prior assistant/tool activity for this same user request:\n${sameTurnParts.join("\n")}`;
+    }
+  }
 
   const turns: Array<{ userText: string; assistantText: string }> = [];
   let currentTurn: { userText: string; assistantText: string } | null = null;
@@ -1092,26 +1136,12 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
-// --- Bridge Key ---
-
-/** Derive a stable key to associate a bridge with a conversation. */
-function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
-  // Use a hash of the first user message + model as a stable key.
-  // This is imperfect but sufficient for single-session use.
-  const firstUser = messages.find((m) => m.role === "user")?.content ?? "";
-  return createHash("sha256")
-    .update(`${modelId}:${firstUser.slice(0, 200)}`)
-    .digest("hex")
-    .slice(0, 16);
-}
-
 // --- Streaming Handler ---
 
 function handleStreamingResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   modelId: string,
-  bridgeKey: string,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1231,14 +1261,16 @@ function handleStreamingResponse(
                 }));
 
                 // Keep the bridge alive for tool result continuation.
-                activeBridges.set(bridgeKey, {
+                const activeBridge: ActiveBridge = {
                   bridge,
                   heartbeatTimer,
                   blobStore: payload.blobStore,
                   mcpTools: payload.mcpTools,
                   pendingExecs: state.pendingExecs,
+                  bridgeKeys: [],
                   onResume: null,
-                });
+                };
+                upsertActiveBridgeKeys(activeBridge);
 
                 sendSSE(makeChunk({}, "tool_calls"));
                 sendDone();
@@ -1285,9 +1317,6 @@ function handleToolResultResume(
   active: ActiveBridge,
   toolResults: ToolResultInfo[],
   modelId: string,
-  tools: OpenAIToolDef[],
-  accessToken: string,
-  bridgeKey: string,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
 
@@ -1341,7 +1370,6 @@ function handleToolResultResume(
   }
 
   // Now stream the continuation response.
-  // Reuse the same bridgeKey so subsequent tool calls can be found by deriveBridgeKey().
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
   const stream = new ReadableStream({
@@ -1442,15 +1470,17 @@ function handleToolResultResume(
                     },
                   }],
                 }));
-
-                activeBridges.set(bridgeKey, {
+                // Keep the bridge alive for tool result continuation.
+                const activeBridge: ActiveBridge = {
                   bridge,
                   heartbeatTimer,
                   blobStore,
                   mcpTools,
                   pendingExecs: state.pendingExecs,
+                  bridgeKeys: [],
                   onResume: null,
-                });
+                };
+                upsertActiveBridgeKeys(activeBridge);
 
                 sendSSE(makeChunk({}, "tool_calls"));
                 sendDone();
